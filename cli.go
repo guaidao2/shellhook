@@ -139,7 +139,7 @@ func parseOpts(args []string) []string {
 	return args
 }
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func help() {
 	fmt.Printf(`shellhook %s —— AWD 场景下的 execve / openat / 出网拦截器
@@ -147,12 +147,14 @@ func help() {
 用法:
   shellhook run    [选项] -- <程序> [参数...]
   shellhook attach [选项] --pid <pid>
+  shellhook check
   shellhook -h | --help
   shellhook -v | --version
 
 模式:
   run      自己拉起目标进程，从 execve 之前接管
   attach   挂到已在运行的进程（默认遍历它的全部线程）
+  check    自检当前机器：权限、yama 闸门、run/attach 能不能用
 
 选项:
   --pid <pid>          attach 的目标进程号（仅 attach）
@@ -173,6 +175,7 @@ func help() {
   选项用长格式（--block-out），短格式只有 -h 和 -v。
 
 示例:
+  shellhook check
   shellhook run -- ./victim
   shellhook run --log-only -- ./victim
   shellhook attach --pid 1234 --fake-flag /flag --decoy /tmp/.d/flag

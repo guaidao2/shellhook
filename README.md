@@ -34,12 +34,16 @@ shellhook 用 `ptrace` 把目标进程（以及它 fork/clone 出来的所有子
 - **学习模式**：`--learn-secs N` 先放行 N 秒并记录目的地址，到点自动切换为拦截，学到的地址可通过 `--allow-file` 落盘复用
 - **子进程跟随**：`system()`、`sh -c`、fork 出来的孙进程都在网里
 - **干净退出**：Ctrl-C / `SIGTERM` 只 detach，不连累被保护的服务
+- **开箱自检**：`shellhook check` 报权限、yama 闸门，并真的 fork 一个子进程验证链路
 
 ## 快速开始
 
 ```bash
 # 编译（需要 Go 1.21+）
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o shellhook .
+
+# 先自检这台机器能不能用
+./shellhook check
 
 # 自己拉起服务
 sudo ./shellhook run -- ./victim
@@ -60,7 +64,62 @@ sudo ./shellhook run --block-out --learn-secs 60 \
   --allow-file /tmp/sh_allow -- ./victim
 ```
 
-需要 root 或具备 `ptrace` 权限（`kernel.yama.ptrace_scope` 允许的前提下）。
+## 权限与 ptrace 闸门
+
+shellhook 靠 ptrace 工作，能不能挂上去只看两件事：权限，和内核的 `yama` 限制。
+
+**权限**：跟踪者要和目标**同 uid**，或者持有 `CAP_SYS_PTRACE`（root 天然有）。所以 root 环境下没有障碍；服务降权到 `www-data` 而你也是 `www-data` 也能挂；比目标权限低就不行。
+
+**yama 的 `ptrace_scope`**：
+
+| 值 | 含义 |
+| --- | --- |
+| 0 | 不限制，同 uid 可以 attach 任意进程 |
+| 1 | 只能 attach 自己的直接子进程（多数发行版默认） |
+| 2 | 只允许 root，或显式声明过的父进程 |
+| 3 | 完全禁止 attach |
+
+先看当前状态：
+
+```bash
+id
+cat /proc/sys/kernel/yama/ptrace_scope
+```
+
+临时放开（重启失效，需要 root）：
+
+```bash
+echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+# 等价写法
+sudo sysctl -w kernel.yama.ptrace_scope=0
+```
+
+要永久生效就写进 `/etc/sysctl.d/99-ptrace.conf`：
+
+```
+kernel.yama.ptrace_scope = 0
+```
+
+然后 `sudo sysctl --system` 应用。
+
+两点经验：
+
+- **`run` 模式不受 scope 影响**。目标是你 fork 出来的子进程，天然满足「直接子进程」，scope=1 也能用；真正会被卡的是 attach 一个已经在跑的、跟你没有父子关系的服务。
+- **容器里要先看 capability**。Docker 默认集合里没有 `CAP_SYS_PTRACE`，需要 `--cap-add=SYS_PTRACE`；容器内部同 uid 跟踪一般没问题，跨容器不行。
+
+不想逐条看的话，直接跑 `./shellhook check`：它会把 uid、`CAP_SYS_PTRACE`、yama 档位打出来，然后真 fork 一个 `/bin/true` 跟一次，最后给出 run / attach 两种模式各自能不能用的结论。退出码 0 表示 run 模式可用。
+
+`check` 的典型输出：
+
+```
+shellhook check
+
+uid/euid       : 0/0 (root)
+CAP_SYS_PTRACE : yes
+yama scope     : 0    (unrestricted)
+run mode       : OK  (can fork + trace a child)
+attach mode    : likely OK  (scope=0，同 uid 的目标可直接挂)
+```
 
 ## 选项
 

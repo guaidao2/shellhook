@@ -28,6 +28,8 @@ func main() {
 		cmdRun(args[1:])
 	case "attach":
 		cmdAttach(args[1:])
+	case "check":
+		cmdCheck()
 	case "-h", "--help", "help":
 		help()
 	case "-v", "--version", "version":
@@ -47,7 +49,7 @@ func cmdRun(args []string) {
 	preparePolicy()
 
 	attr := &syscall.ProcAttr{
-		Dir:   ".",
+		Dir:   "", // 继承当前目录，避免 chdir 到无权限路径失败
 		Env:   os.Environ(),
 		Files: []uintptr{0, 1, 2},
 		Sys:   &syscall.SysProcAttr{Ptrace: true},
