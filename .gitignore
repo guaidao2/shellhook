@@ -1,0 +1,10 @@
+# 构建产物
+shellhook
+shellhook-linux-amd64
+*.exe
+
+# 实验环境（含远端凭据，绝不入库）
+lab/
+.tmp/
+*.bak
+blocks.json
