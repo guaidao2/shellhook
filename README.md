@@ -27,7 +27,8 @@ shellhook 用 `ptrace` 把目标进程（以及它 fork/clone 出来的所有子
 
 ## 特性
 
-- **两种模式**：`run` 自己拉起目标，`attach --pid` 挂已有进程（默认遍历全部线程，`--main-only` 只挂主线程）
+- **两种模式**：`run` 自己拉起目标，`attach --pid` 挂已有进程（默认把命中的线程组整个展开，`--main-only` 只挂主线程）
+- **按名字挂**：`attach --name nginx` 按 comm 匹配，master 和 worker 一次挂完，可重复
 - **只记录不拦**：`--log-only`，用于比赛前摸清服务的正常行为
 - **假 flag**：`--fake-flag <路径> --decoy <诱饵文件>`，默认关闭；诱饵文件不存在会自动生成
 - **出网管控**：`--block-out` + `--allow-cidr`，回环永远放行
@@ -126,8 +127,9 @@ attach mode    : likely OK  (scope=0，同 uid 的目标可直接挂)
 | 选项 | 说明 |
 | --- | --- |
 | `--pid <pid>` | attach 的目标进程号（仅 attach） |
+| `--name <进程名>` | 按 comm 匹配挂载，可重复；`nginx` 会同时匹配 master 和 worker |
 | `--log-only` | 只记录不拦截 |
-| `--main-only` | attach 时只挂主线程 |
+| `--main-only` | attach 时只挂主线程（`--pid` / `--name` 都适用） |
 | `--fake-flag <路径>` | 保护路径，可重复 |
 | `--decoy <文件>` | 诱饵文件，不存在时自动生成 |
 | `--block-out` | 拦截对外 `connect` / `sendto` / `sendmsg` / `sendmmsg` |
@@ -148,6 +150,23 @@ attach mode    : likely OK  (scope=0，同 uid 的目标可直接挂)
 5. 日志里出现 `BLOCKED` 就是有人在打，把它连同 pid、路径、目的地址一起留档
 
 建议顺序是「先记录、再拦截」——AWD 里误伤自家业务是确定掉分，漏一次还有机会。
+
+### 挂 Web 服务（nginx / apache / php-fpm）
+
+这类服务不能 `run` 包起来，只能事后按名字挂：
+
+```bash
+shellhook attach --name nginx                            # master 和所有 worker 一起挂
+shellhook attach --name apache2 --log-only                # 先摸基线
+shellhook attach --name php-fpm8.4 --fake-flag /flag --decoy /tmp/.d/flag
+```
+
+有两点必须注意：
+
+- **ptrace 只跟「挂上之后才 fork 出来」的子进程。** 先于 hook 存在的 worker 不在网里，所以 `--name` 会把当前所有匹配的进程都挂上，而不是只挂 master。实测只挂 master 时，已有 worker 的 syscall 一条都看不到。
+- **先 `--log-only` 摸一轮再开拦。** CGI 模式的站点、或者 `ErrorLog "|/usr/bin/rotatelogs"` 这种管道日志，本来就会 execve；一开拦截就会把它们拦死。这类只能靠 `--fake-flag` 那层，不能拦 execve。
+
+nginx 平滑 reload 之后，新 worker 是 master fork 出来的，会被自动跟上；如果 master 整个重启，pid 全变了，重新跑一遍 `--name nginx` 就行。
 
 ## 能力边界
 

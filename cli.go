@@ -60,10 +60,14 @@ var (
 	hits      int
 	blocked   int
 	fakeGot   int
+	fdLeaks   int
 
 	// 假 flag：默认关闭，--fake-flag <被保护路径> --decoy <诱饵文件>
 	fakeFlags []string
 	decoyPath string
+
+	// 按进程名 attach
+	attachNames []string
 
 	// 出网限制：默认关闭，--block-out 开启，--allow-cidr 加白名单（回环永远放行）
 	blockOut  bool
@@ -108,6 +112,9 @@ func parseOpts(args []string) []string {
 		case "--block-out":
 			blockOut = true
 			args = args[1:]
+		case "--name":
+			attachNames = append(attachNames, need())
+			args = args[2:]
 		case "--pid":
 			v, err := strconv.Atoi(need())
 			if err != nil || v <= 0 {
@@ -149,7 +156,7 @@ func parseOpts(args []string) []string {
 	return rest
 }
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func help() {
 	fmt.Printf(`shellhook %s —— AWD 场景下的 execve / openat / 出网拦截器
@@ -157,6 +164,7 @@ func help() {
 用法:
   shellhook run    [选项] -- <程序> [参数...]
   shellhook attach [选项] --pid <pid>
+  shellhook attach [选项] --name <进程名>
   shellhook check
   shellhook -h | --help
   shellhook -v | --version
@@ -168,8 +176,9 @@ func help() {
 
 选项:
   --pid <pid>          attach 的目标进程号（仅 attach）
+  --name <进程名>      按 comm 名挂，可重复；nginx 这类会连 master 和 worker 一起挂
   --log-only           只记录不拦截
-  --main-only          attach 时只挂主线程
+  --main-only          attach 时只挂主线程（仅对 --pid 生效，--name 恒为全线程）
   --fake-flag <路径>   把对该路径的 open/openat/openat2 重定向到诱饵，可重复
   --decoy <文件>       诱饵文件；不存在会自动生成
   --block-out          拦截对外 connect / sendto / sendmsg / sendmmsg
@@ -189,6 +198,8 @@ func help() {
   shellhook run -- ./victim
   shellhook run --log-only -- ./victim
   shellhook attach --pid 1234 --fake-flag /flag --decoy /tmp/.d/flag
+  shellhook attach --name nginx
+  shellhook attach --name php-fpm8.4 --log-only
   shellhook run --block-out --learn-secs 60 --allow-file /tmp/sh_allow -- ./victim
   shellhook run --block-out --allow-cidr 10.0.0.0/8 -- ./victim
 

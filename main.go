@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -112,57 +113,59 @@ func cmdAttach(args []string) {
 		fmt.Fprintln(os.Stderr, "attach 只能接一个 pid")
 		os.Exit(2)
 	}
-	pid := attachPid
-	if pid <= 0 {
+	if attachPid == 0 && len(attachNames) == 0 {
 		usage()
 	}
 	prepareDecoy()
 	preparePolicy()
 
-	targets := []int{pid}
-	if !mainOnly {
-		t, err := threadIDs(pid)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "读取 %d 的线程列表失败: %v（可用 --main-only 接受降级）\n", pid, err)
-			os.Exit(1)
-		}
-		targets = t
-	}
-
 	opts := optTracesysgood | optTracefork | optTracevfork | optTraceclone | optTraceexec
 	states := map[int]bool{}
 	attached := 0
-	for _, tid := range targets {
-		if err := ptrace(reqSeize, tid, 0, uintptr(opts)); err != nil {
-			logf("seize tid=%d failed: %v", tid, err)
-			continue
+
+	// 按 pid：把这个进程的所有线程都挂上
+	if attachPid > 0 {
+		targets := []int{attachPid}
+		if !mainOnly {
+			t, err := threadIDs(attachPid)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "读取 %d 的线程列表失败: %v（可用 --main-only 接受降级）\n", attachPid, err)
+				os.Exit(1)
+			}
+			targets = t
 		}
-		if err := ptrace(reqInterrupt, tid, 0, 0); err != nil {
-			logf("interrupt tid=%d failed: %v（已 detach）", tid, err)
-			_ = ptrace(reqDetach, tid, 0, 0)
-			continue
+		for _, tid := range targets {
+			if seizeOne(tid, opts, states) {
+				attached++
+			}
 		}
-		var ws syscall.WaitStatus
-		if _, err := syscall.Wait4(tid, &ws, syscall.WALL, nil); err != nil {
-			logf("wait tid=%d failed: %v（已 detach）", tid, err)
-			_ = ptrace(reqDetach, tid, 0, 0)
-			continue
-		}
-		// 现在已经停住了，这时读 /proc/<tid>/syscall 才稳定：
-		// 有 syscall 号说明它正卡在一个 syscall 里，下一次停是出口
-		inSys := inSyscallNow(tid)
-		if err := ptrace(reqSyscall, tid, 0, 0); err != nil {
-			logf("continue tid=%d FAILED: %v（已 detach）", tid, err)
-			_ = ptrace(reqDetach, tid, 0, 0)
-			continue
-		}
-		states[tid] = !inSys
-		if debug {
-			logf("tid=%d 相位初始化: in_syscall=%v 下一次停=%s", tid, inSys, phaseName(states[tid]))
-		}
-		addTid(tid)
-		attached++
 	}
+
+	// 按名字：/proc 里每个 tid 都会列出来，直接逐个挂
+	for _, name := range attachNames {
+		pids := findPidsByName(name)
+		logf("--name %s 匹配到 %d 个 tid", name, len(pids))
+		for _, p := range pids {
+			// 命中的可能只是一个线程，把它所在的整个线程组展开，
+			// 否则改过名的线程（JVM/GC、prctl(PR_SET_NAME)）会漏
+			tgid := threadGroup(p)
+			targets := []int{tgid}
+			if !mainOnly {
+				if t, err := threadIDs(tgid); err == nil {
+					targets = t
+				}
+			}
+			for _, tid := range targets {
+				if _, ok := stGet(states, tid); ok {
+					continue
+				}
+				if seizeOne(tid, opts, states) {
+					attached++
+				}
+			}
+		}
+	}
+
 	if attached == 0 {
 		fmt.Fprintln(os.Stderr, "attach failed: no thread seized")
 		os.Exit(1)
@@ -172,14 +175,59 @@ func cmdAttach(args []string) {
 	if logOnly {
 		mode = "LOG-ONLY"
 	}
-	logf("attached pid=%d threads=%d mode=%s", pid, attached, mode)
+	logf("attached %d thread(s) mode=%s names=%v", attached, mode, attachNames)
 
 	installDetachHandler()
 	trace(states, true, 0)
 }
 
-// installDetachHandler 让 Ctrl-C / SIGTERM 只断开 ptrace，不连累被保护的服务
+// seizeOne 完整接管一个 tid：SEIZE → INTERRUPT → 等停 → 定相位 → 继续
+func seizeOne(tid, opts int, states map[int]bool) bool {
+	if err := ptrace(reqSeize, tid, 0, uintptr(opts)); err != nil {
+		logf("seize tid=%d failed: %v", tid, err)
+		return false
+	}
+	if err := ptrace(reqInterrupt, tid, 0, 0); err != nil {
+		logf("interrupt tid=%d failed: %v（已 detach）", tid, err)
+		_ = ptrace(reqDetach, tid, 0, 0)
+		return false
+	}
+	// INTERRUPT 的 trap 在返回用户态时才处理，卡在不可中断睡眠的进程可能等不到；
+	// 这里加超时，避免把整个 tracer 拖住。
+	var ws syscall.WaitStatus
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for {
+		w, err := syscall.Wait4(tid, &ws, syscall.WALL|syscall.WNOHANG, nil)
+		if err != nil {
+			logf("wait tid=%d failed: %v（已 detach）", tid, err)
+			_ = ptrace(reqDetach, tid, 0, 0)
+			return false
+		}
+		if w == tid {
+			break
+		}
+		if time.Now().After(deadline) {
+			logf("tid=%d INTERRUPT 后 1.5s 没停下（可能卡在不可中断睡眠），放弃", tid)
+			_ = ptrace(reqDetach, tid, 0, 0)
+			return false
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	inSys := inSyscallNow(tid)
+	if err := ptrace(reqSyscall, tid, 0, 0); err != nil {
+		logf("continue tid=%d FAILED: %v（已 detach）", tid, err)
+		_ = ptrace(reqDetach, tid, 0, 0)
+		return false
+	}
+	stSet(states, tid, !inSys)
+	if debug {
+		logf("tid=%d 相位初始化: in_syscall=%v 下一次停=%s", tid, inSys, phaseName(!inSys))
+	}
+	addTid(tid)
+	return true
+}
 
+// installDetachHandler 让 Ctrl-C / SIGTERM 只断开 ptrace，不连累被保护的服务
 func installDetachHandler() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
@@ -189,6 +237,7 @@ func installDetachHandler() {
 		for _, tid := range t {
 			_ = ptrace(reqDetach, tid, 0, 0)
 		}
+		logf("stats: execve hits=%d blocked=%d decoy-served=%d fd-leaks=%d", hits, blocked, fakeGot, fdLeaks)
 		logf("detached %d thread(s), service left alive", len(t))
 		os.Exit(0)
 	}()
