@@ -51,10 +51,18 @@ func inSyscallNow(tid int) bool {
 	return true
 }
 
-func threadIDs(pid int) []int {
+// phaseName 只用于调试日志
+func phaseName(nextIsEntry bool) string {
+	if nextIsEntry {
+		return "entry"
+	}
+	return "exit"
+}
+
+func threadIDs(pid int) ([]int, error) {
 	ents, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
 	if err != nil {
-		return []int{pid}
+		return nil, err
 	}
 	out := make([]int, 0, len(ents))
 	for _, e := range ents {
@@ -65,5 +73,5 @@ func threadIDs(pid int) []int {
 	if len(out) == 0 {
 		out = append(out, pid)
 	}
-	return out
+	return out, nil
 }

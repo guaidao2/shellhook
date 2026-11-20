@@ -27,11 +27,33 @@ func isProtected(path string) bool {
 // redirectOpen 把 open 的路径改写成诱饵文件。
 // 短路径原地改；诱饵更长时写到栈下方的空余区，再把寄存器指过去。
 
-func redirectOpen(pid int, regs *syscall.PtraceRegs, nr int, pathPtr uintptr, orig string) bool {
+func redirectOpen(pid int, regs *syscall.PtraceRegs, a abi, pathPtr uintptr, orig string) bool {
 	if decoyPath == "" {
 		return false
 	}
 	want := append([]byte(decoyPath), 0)
+
+	if a.compat {
+		// 先试原地改（最稳）
+		if len(want) <= len(orig)+1 {
+			return writeBytes(pid, pathPtr, want) == nil
+		}
+		// 真 32 位进程（CS=0x23）的栈在 32 位地址空间里，可以用低地址 scratch；
+		// 64 位进程发 int 0x80 时 Rsp 是高地址，塞不进 32 位指针，只能降级。
+		if regs.Cs != csCompat32 {
+			return false
+		}
+		scratch := uintptr(uint32(regs.Rsp)) - 1024
+		if err := writeBytes(pid, scratch, want); err != nil {
+			return false
+		}
+		if a.nr == c32Open {
+			regs.Rbx = uint64(scratch)
+		} else {
+			regs.Rcx = uint64(scratch)
+		}
+		return setRegs(pid, regs) == nil
+	}
 
 	if len(want) <= len(orig)+1 {
 		if err := writeBytes(pid, pathPtr, want); err != nil {
@@ -46,11 +68,13 @@ func redirectOpen(pid int, regs *syscall.PtraceRegs, nr int, pathPtr uintptr, or
 		return false
 	}
 	if debug {
-		logf("scratch=%#x readback=%q", scratch, readCString(pid, scratch, 128))
+		rb, _ := readCString(pid, scratch, 128)
+		logf("scratch=%#x readback=%q", scratch, rb)
 	}
-	if nr == sysOpen {
+	switch {
+	case a.openNr() == sysOpen:
 		regs.Rdi = uint64(scratch)
-	} else {
+	default:
 		regs.Rsi = uint64(scratch)
 	}
 	if err := setRegs(pid, regs); err != nil {
@@ -64,8 +88,6 @@ func redirectOpen(pid int, regs *syscall.PtraceRegs, nr int, pathPtr uintptr, or
 	}
 	return true
 }
-
-// readSockaddr 从 tracee 内存里解析 sockaddr_in / sockaddr_in6
 
 func allowedOut(ip net.IP) bool {
 	if ip == nil {
@@ -171,6 +193,8 @@ func prepareDecoy() {
 		fmt.Fprintln(os.Stderr, "--fake-flag 需要配合 --decoy <诱饵文件> 使用")
 		os.Exit(2)
 	}
+	// 不管诱饵是否已存在，都要把受保护文件的 inode 记下来
+	defer loadProtectedIDs()
 	if _, err := os.Stat(decoyPath); err == nil {
 		return
 	}

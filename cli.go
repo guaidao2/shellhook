@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -21,11 +22,12 @@ const (
 	reqInterrupt   = 0x4207
 	reqSyscallinfo = 0x420e
 
-	optTracefork  = 0x00000002
-	optTracevfork = 0x00000004
-	optTraceclone = 0x00000008
-	optTraceexec  = 0x00000010
-	optExitkill   = 0x00100000
+	optTracesysgood = 0x00000001
+	optTracefork    = 0x00000002
+	optTracevfork   = 0x00000004
+	optTraceclone   = 0x00000008
+	optTraceexec    = 0x00000010
+	optExitkill     = 0x00100000
 
 	evFork  = 1
 	evVfork = 2
@@ -33,18 +35,21 @@ const (
 	evExec  = 4
 	evStop  = 128
 
-	sysOpen     = 2
-	sysOpenat   = 257
-	sysOpenat2  = 437
-	sysConnect  = 42
-	sysSendto   = 44
-	sysSendmsg  = 46
-	sysSendmmsg = 307
-	sysExecve   = 59
-	sysExecveat = 322
-	eacces      = 13
-	enoent      = 2
-	enetunreach = 101
+	sysOpen         = 2
+	sysOpenat       = 257
+	sysOpenat2      = 437
+	sysOpenByHandle = 304
+	pathMax         = 4096
+	sysConnect      = 42
+	sysSendto       = 44
+	sysSendmsg      = 46
+	sysSendmmsg     = 307
+	sysExecve       = 59
+	sysExecveat     = 322
+	eacces          = 13
+	eperm           = 1
+	enoent          = 2
+	enetunreach     = 101
 )
 
 var (
@@ -76,8 +81,22 @@ var (
 // parseOpts 吃掉前导选项，返回剩下的位置参数
 
 func parseOpts(args []string) []string {
+	var rest []string
+	fail := func(format string, a ...any) {
+		fmt.Fprintf(os.Stderr, format+"\n", a...)
+		os.Exit(2)
+	}
 	for len(args) > 0 {
-		switch args[0] {
+		tok := args[0]
+		need := func() string {
+			if len(args) < 2 {
+				fail("选项 %s 缺少参数", tok)
+			}
+			return args[1]
+		}
+		switch tok {
+		case "--":
+			return append(rest, args[1:]...)
 		case "-h", "--help":
 			help()
 		case "--log-only":
@@ -86,60 +105,51 @@ func parseOpts(args []string) []string {
 		case "--main-only":
 			mainOnly = true
 			args = args[1:]
-		case "--pid":
-			if len(args) < 2 {
-				usage()
-			}
-			attachPid, _ = strconv.Atoi(args[1])
-			args = args[2:]
-		case "--fake-flag":
-			if len(args) < 2 {
-				usage()
-			}
-			fakeFlags = append(fakeFlags, args[1])
-			args = args[2:]
 		case "--block-out":
 			blockOut = true
 			args = args[1:]
-		case "--learn-secs":
-			if len(args) < 2 {
-				usage()
+		case "--pid":
+			v, err := strconv.Atoi(need())
+			if err != nil || v <= 0 {
+				fail("--pid 需要正整数")
 			}
-			learnSecs, _ = strconv.Atoi(args[1])
+			attachPid = v
+			args = args[2:]
+		case "--fake-flag":
+			fakeFlags = append(fakeFlags, need())
+			args = args[2:]
+		case "--learn-secs":
+			v, err := strconv.Atoi(need())
+			if err != nil || v < 0 {
+				fail("--learn-secs 需要非负整数")
+			}
+			learnSecs = v
 			args = args[2:]
 		case "--allow-file":
-			if len(args) < 2 {
-				usage()
-			}
-			allowFile = args[1]
+			allowFile = need()
 			args = args[2:]
 		case "--allow-cidr":
-			if len(args) < 2 {
-				usage()
-			}
-			if _, n, err := net.ParseCIDR(args[1]); err == nil {
-				allowNets = append(allowNets, n)
+			if _, n, err := net.ParseCIDR(need()); err != nil {
+				fail("非法 CIDR: %s", args[1])
 			} else {
-				fmt.Fprintf(os.Stderr, "非法 CIDR: %s\n", args[1])
-				os.Exit(2)
+				allowNets = append(allowNets, n)
 			}
 			args = args[2:]
 		case "--decoy":
-			if len(args) < 2 {
-				usage()
-			}
-			decoyPath = args[1]
+			decoyPath = need()
 			args = args[2:]
-		case "--":
-			return args[1:]
 		default:
-			return args
+			if strings.HasPrefix(tok, "-") {
+				fail("未知选项: %s", tok)
+			}
+			rest = append(rest, tok)
+			args = args[1:]
 		}
 	}
-	return args
+	return rest
 }
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func help() {
 	fmt.Printf(`shellhook %s —— AWD 场景下的 execve / openat / 出网拦截器

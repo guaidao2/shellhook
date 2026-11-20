@@ -10,9 +10,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -54,7 +56,16 @@ func cmdRun(args []string) {
 		Files: []uintptr{0, 1, 2},
 		Sys:   &syscall.SysProcAttr{Ptrace: true},
 	}
-	pid, err := syscall.ForkExec(args[0], args, attr)
+	prog := args[0]
+	if !strings.ContainsRune(prog, '/') {
+		if p, err := exec.LookPath(prog); err == nil {
+			prog = p
+		} else {
+			fmt.Fprintf(os.Stderr, "找不到程序 %q: %v\n", args[0], err)
+			os.Exit(1)
+		}
+	}
+	pid, err := syscall.ForkExec(prog, args, attr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fork/exec failed: %v\n", err)
 		os.Exit(1)
@@ -65,7 +76,7 @@ func cmdRun(args []string) {
 		fmt.Fprintf(os.Stderr, "wait failed: %v\n", err)
 		os.Exit(1)
 	}
-	opts := optTracefork | optTracevfork | optTraceclone | optTraceexec | optExitkill
+	opts := optTracesysgood | optTracefork | optTracevfork | optTraceclone | optTraceexec | optExitkill
 	if err := ptrace(reqSetoptions, pid, 0, uintptr(opts)); err != nil {
 		fmt.Fprintf(os.Stderr, "setoptions failed: %v\n", err)
 		os.Exit(1)
@@ -80,15 +91,26 @@ func cmdRun(args []string) {
 	if logOnly {
 		mode = "LOG-ONLY"
 	}
-	logf("launched pid=%d mode=%s target=%v", pid, mode, args)
+	logf("config: mode=%s fake-flag=%v decoy=%q block-out=%v allow-cidr=%d learn-secs=%d",
+		mode, fakeFlags, decoyPath, blockOut, len(allowNets), learnSecs)
+	logf("launched pid=%d target=%v", pid, args)
 
 	trace(map[int]bool{pid: true}, false, pid)
 }
 
 func cmdAttach(args []string) {
 	rest := parseOpts(args)
-	if attachPid == 0 && len(rest) > 0 {
-		attachPid, _ = strconv.Atoi(rest[0])
+	if attachPid == 0 && len(rest) == 1 {
+		v, err := strconv.Atoi(rest[0])
+		if err != nil || v <= 0 {
+			fmt.Fprintf(os.Stderr, "attach 需要一个合法 pid: %q\n", rest[0])
+			os.Exit(2)
+		}
+		attachPid = v
+	}
+	if attachPid == 0 && len(rest) > 1 {
+		fmt.Fprintln(os.Stderr, "attach 只能接一个 pid")
+		os.Exit(2)
 	}
 	pid := attachPid
 	if pid <= 0 {
@@ -99,10 +121,15 @@ func cmdAttach(args []string) {
 
 	targets := []int{pid}
 	if !mainOnly {
-		targets = threadIDs(pid)
+		t, err := threadIDs(pid)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "读取 %d 的线程列表失败: %v（可用 --main-only 接受降级）\n", pid, err)
+			os.Exit(1)
+		}
+		targets = t
 	}
 
-	opts := optTracefork | optTracevfork | optTraceclone | optTraceexec
+	opts := optTracesysgood | optTracefork | optTracevfork | optTraceclone | optTraceexec
 	states := map[int]bool{}
 	attached := 0
 	for _, tid := range targets {
@@ -110,20 +137,28 @@ func cmdAttach(args []string) {
 			logf("seize tid=%d failed: %v", tid, err)
 			continue
 		}
-		// 先看它是否卡在 syscall 里，决定第一次停算入口还是出口
-		states[tid] = !inSyscallNow(tid)
 		if err := ptrace(reqInterrupt, tid, 0, 0); err != nil {
-			logf("interrupt tid=%d failed: %v", tid, err)
+			logf("interrupt tid=%d failed: %v（已 detach）", tid, err)
+			_ = ptrace(reqDetach, tid, 0, 0)
 			continue
 		}
 		var ws syscall.WaitStatus
 		if _, err := syscall.Wait4(tid, &ws, syscall.WALL, nil); err != nil {
-			logf("wait tid=%d failed: %v", tid, err)
+			logf("wait tid=%d failed: %v（已 detach）", tid, err)
+			_ = ptrace(reqDetach, tid, 0, 0)
 			continue
 		}
+		// 现在已经停住了，这时读 /proc/<tid>/syscall 才稳定：
+		// 有 syscall 号说明它正卡在一个 syscall 里，下一次停是出口
+		inSys := inSyscallNow(tid)
 		if err := ptrace(reqSyscall, tid, 0, 0); err != nil {
-			logf("continue tid=%d FAILED: %v", tid, err)
+			logf("continue tid=%d FAILED: %v（已 detach）", tid, err)
+			_ = ptrace(reqDetach, tid, 0, 0)
 			continue
+		}
+		states[tid] = !inSys
+		if debug {
+			logf("tid=%d 相位初始化: in_syscall=%v 下一次停=%s", tid, inSys, phaseName(states[tid]))
 		}
 		addTid(tid)
 		attached++

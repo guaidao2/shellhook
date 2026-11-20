@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"syscall"
 	"unsafe"
@@ -23,22 +24,51 @@ func peek(pid int, addr uintptr) (uint64, error) {
 	return word, nil
 }
 
-func readCString(pid int, addr uintptr, max int) string {
+// readCString 从 tracee 读 NUL 结尾字符串。
+// ok=false 表示读失败或超过上限——调用方必须按"不可信"处理，不能当成没命中。
+func readCString(pid int, addr uintptr, max int) (string, bool) {
 	out := make([]byte, 0, 64)
-	for i := 0; i < max; i += 8 {
-		w, err := peek(pid, addr+uintptr(i))
+	// 按 8 字节对齐读，避免字符串落在页尾时跨页 EIO 被误判成不可读
+	aligned := addr &^ 7
+	off := int(addr & 7)
+	for len(out) < max {
+		w, err := peek(pid, aligned)
 		if err != nil {
-			break
+			return string(out), false
 		}
 		b := (*[8]byte)(unsafe.Pointer(&w))[:]
-		for _, c := range b {
+		for ; off < 8 && len(out) < max; off++ {
+			c := b[off]
 			if c == 0 {
-				return string(out)
+				return string(out), true
 			}
 			out = append(out, c)
 		}
+		aligned += 8
+		off = 0
 	}
-	return string(out)
+	return string(out), false // 超过上限仍未结束
+}
+
+// readByte 读 tracee 里的一个字节
+func readByte(pid int, addr uintptr) (byte, bool) {
+	aligned := addr &^ 7
+	w, err := peek(pid, aligned)
+	if err != nil {
+		return 0, false
+	}
+	return byte(w >> (8 * (addr & 7))), true
+}
+
+// readU32 读 tracee 里的一个 32 位小端值（用于 32 位 ABI 的指针参数）
+func readU32(pid int, addr uintptr) uint32 {
+	aligned := addr &^ 7
+	w, err := peek(pid, aligned)
+	if err != nil {
+		return 0
+	}
+	shift := 8 * (addr & 7)
+	return uint32(w >> shift)
 }
 
 func getRegs(pid int) (*syscall.PtraceRegs, error) {
@@ -91,23 +121,39 @@ func writeBytes(pid int, addr uintptr, data []byte) error {
 	return nil
 }
 
+// readSockaddr 按 family 读对应长度的 sockaddr。
+// 读失败返回 error，调用方必须按"未授权"处理，不能放行。
 func readSockaddr(pid int, addr uintptr) (net.IP, int, int, error) {
-	buf := make([]byte, 28)
-	for i := 0; i < len(buf); i += 8 {
+	b0, ok0 := readByte(pid, addr)
+	b1, ok1 := readByte(pid, addr+1)
+	if !ok0 || !ok1 {
+		return nil, 0, 0, errors.New("读 sockaddr family 失败")
+	}
+	fam := int(b0) | int(b1)<<8
+
+	var size int
+	switch fam {
+	case 2: // AF_INET
+		size = 16
+	case 10: // AF_INET6
+		size = 24 // 只读到 addr 结束，scope_id 用不到，少读 4 字节避免越界
+	default:
+		return nil, 0, fam, nil
+	}
+
+	buf := make([]byte, size)
+	for i := 0; i < size; i += 8 {
 		w, err := peek(pid, addr+uintptr(i))
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, fam, err
 		}
 		copy(buf[i:], (*[8]byte)(unsafe.Pointer(&w))[:])
 	}
-	fam := int(binary.LittleEndian.Uint16(buf[0:2]))
-	switch fam {
-	case 2: // AF_INET
-		return net.IPv4(buf[4], buf[5], buf[6], buf[7]), int(binary.BigEndian.Uint16(buf[2:4])), fam, nil
-	case 10: // AF_INET6
-		return net.IP(append([]byte(nil), buf[8:24]...)), int(binary.BigEndian.Uint16(buf[2:4])), fam, nil
+	port := int(binary.BigEndian.Uint16(buf[2:4]))
+	if fam == 2 {
+		return net.IPv4(buf[4], buf[5], buf[6], buf[7]), port, fam, nil
 	}
-	return nil, 0, fam, nil
+	return net.IP(append([]byte(nil), buf[8:24]...)), port, fam, nil
 }
 
 func msgNamePtr(pid int, hdr uintptr) uintptr {
@@ -116,6 +162,11 @@ func msgNamePtr(pid int, hdr uintptr) uintptr {
 		return 0
 	}
 	return uintptr(w)
+}
+
+// msgNamePtr32 32 位 msghdr 的 msg_name 只有 4 字节，不能按 8 字节读
+func msgNamePtr32(pid int, hdr uintptr) uintptr {
+	return uintptr(readU32(pid, hdr))
 }
 
 // loadAllowFile 读取白名单文件，一行一个 IP 或 CIDR

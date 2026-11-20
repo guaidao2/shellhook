@@ -164,6 +164,14 @@ attach mode    : likely OK  (scope=0，同 uid 的目标可直接挂)
 - **`mprotect` / `mmap` 的 `PROT_EXEC`**：目前不拦 shellcode staging，可以后续加开关
 - **控制流劫持本身**：这层只有 CET shadow stack 或编译期 CFI 能做，且要求目标二进制本身开启
 
+几个部署相关的已知限制：
+
+- **跨 namespace attach**：在宿主机上挂容器内的进程时，受保护文件的 `(dev, ino)` 在两边不是同一个文件，按 inode 的判定会失效，只剩路径字符串那一层。推荐在容器内跑。
+- **非 root 追踪**：服务如果自己调 `prctl(PR_SET_DUMPABLE, 0)`，非 root 的追踪者读不到 `/proc/<pid>/fd`、`/proc/<pid>/root`、`/proc/<pid>/cwd`，入口和出口两层 inode 判定会一起退化，只剩路径字符串比对。root 部署不受影响。
+- **32 位目标**：i386 的 `close` 注入依赖 `int 0x80`，如果目标走 `sysenter`（vDSO 的 `__kernel_vsyscall`）就注入不了。所以 32 位目标的 open 全部在**入口**按 inode 判定并直接拒，不挂出口复核；入口读不到 `/proc` 时 inode 层整体失效，只剩字符串比对。另外入口单点判定存在一个窄 TOCTOU 窗口：tracee 停住时我们 stat 的是当时的链接，恢复后内核才解析，同进程的另一个线程抢在这中间换掉软链就能让入口判成未命中。64 位有出口 fd 复核兜底，32 位没有。
+- **回环放行**：`--block-out` 永远放行 127.0.0.0/8。本地 DNS（127.0.0.53）或本机代理可以被当成出网跳板，需要的话把回环也纳入白名单策略。
+- **性能**：目前是全量 `PTRACE_SYSCALL`，每个 syscall 停两次。syscall 密集的程序会明显变慢，后续可用 seccomp `RET_TRACE` 只对关心的 syscall 停。
+
 换句话说：它不是杀毒软件，是「利用之后的收益阻断器」。
 
 ## 项目结构
@@ -175,13 +183,24 @@ attach mode    : likely OK  (scope=0，同 uid 的目标可直接挂)
 | `ptrace.go` | ptrace 原语、目标内存读写、寄存器、`sockaddr` 解析 |
 | `proc.go` | 线程枚举、`/proc/<tid>/syscall` 探测 |
 | `policy.go` | 假 flag、出网策略、学习模式、日志 |
-| `trace.go` | 主循环：事件分发、syscall 入口/出口判定、各类 hook |
+| `trace.go` | 主循环：事件分发、相位跟踪、各类 hook、出口复核与 close 注入 |
+| `abi.go` | 64 位 / 32 位兼容 ABI 的寄存器解析、`int 0x80` 判别、close 注入 |
+| `inode.go` | 受保护文件的 `(dev, ino)` 记录、按 tracee 视图解析路径、fd 归属复核 |
+
+## 32 位与内核 ABI
+
+- 同时支持 64 位 `syscall` 与 32 位兼容 ABI。`int 0x80` 的判别看 `RIP-2` 处的指令字节（`cd 80`），因为 64 位代码里发 `int 0x80` 时 `CS` 仍然是 `0x33`。
+- 32 位的 syscall 号与 64 位完全不同（execve=11、open=5、openat=295、openat2=437、execveat=358），兼容表是单独维护的。
+- 内核若支持 `PTRACE_GET_SYSCALL_INFO`，入口/出口直接由内核告知；否则用 per-tid 相位交替，并在每个线程前几次停下时用 `rax == -ENOSYS` 校准。`shellhook check` 的 `syscall-info` 一行会告诉你这台机器走的是哪条。
+- 路径保护是两层：先比字符串，再按 tracee 的 root/cwd/dirfd 解析后比 inode。64 位目标的 open 在出口还会用 `/proc/<pid>/fd/<fd>` 复核一次兜住软链，命中时注入一次 `close` 把真 fd 关掉；32 位目标只在入口判定。
 
 ## 已知的坑（开发备注）
 
 - Go 里做 ptrace 必须 `runtime.LockOSThread()`。ptrace 的「追踪者」身份绑定在具体线程上，goroutine 一换线程，所有 ptrace 调用都会返回 `ESRCH`，现象是目标被挂住不动。
 - 本工具在部分内核上发现 `PTRACE_GET_SYSCALL_INFO` 返回 `op=0`（结构体里只有 `arch` 有值）。因此入口/出口判定做了退化：入口停时内核把 `rax` 置为 `-ENOSYS(-38)`，而出口停是返回值；另外「刚跳过的 syscall 的下一个停必然是出口」用标记单独截住，否则被跳过 syscall 的出口（`rax` 也是 `-38`）会被误判成入口，导致回填的 errno 永远不生效。
 - `PTRACE_POKEDATA` 的第 4 个参数是**要写的值**，不是指针。
+- 开了 `PTRACE_O_TRACESYSGOOD` 之后，syscall 停的信号是 `SIGTRAP|0x80`，其它 `SIGTRAP`（int3、外部投递）必须原样回注，否则会吞掉服务的信号。
+- 出口停上改 `Orig_rax` 没有任何效果（内核已经分发完了），要拒绝只能改 `Rax`。
 
 ## 许可
 
